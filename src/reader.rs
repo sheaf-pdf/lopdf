@@ -1313,20 +1313,18 @@ impl<'a> Reader<'a> {
         Ok((offset, xref, trailer))
     }
 
-    /// Whether most normal entries of a cross-reference section point at the
-    /// header of their own object, as they do in a section describing this file.
+    /// Whether every normal entry of a cross-reference section points at the
+    /// header of its own object, as in a section describing this file. One
+    /// entry that misses is enough to refuse a section: the object it loses may
+    /// be an object stream or a page tree node, and reconstruction finds it.
     fn locates_objects(&self, xref: &Xref) -> bool {
-        let (mut normal, mut located) = (0usize, 0usize);
-        for (&number, entry) in &xref.entries {
-            if let XrefEntry::Normal { offset, generation } = *entry {
-                normal += 1;
+        xref.entries.iter().all(|(&number, entry)| match *entry {
+            XrefEntry::Normal { offset, generation } => {
                 let rest = self.buffer.get(offset as usize..).unwrap_or_default();
-                if Self::parse_object_header(&rest[skip_whitespace(rest, 0)..]) == Some((number, generation)) {
-                    located += 1;
-                }
+                Self::parse_object_header(&rest[skip_whitespace(rest, 0)..]) == Some((number, generation))
             }
-        }
-        normal == 0 || located * 2 > normal
+            _ => true,
+        })
     }
 
     /// Resolve the cross-reference table/stream and trailer, including the
@@ -2216,6 +2214,41 @@ startxref
     assert_eq!(loaded.get_pages().len(), 1);
     // Zero marks a table rebuilt by scanning rather than read at a corrected offset.
     assert_eq!(loaded.xref_start, 0);
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn rebuilds_rather_than_correcting_to_a_table_that_misses_some_objects() {
+    // 10 bytes were removed before the page tree, the last object, only. The nearby `xref`
+    // keyword leads to a table whose other two entries still locate their objects, but
+    // whose entry for the page tree misses it: used, it loads the file without any pages.
+    let header = "%PDF-1.5\n";
+    let obj1 = "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n";
+    let obj3 = "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n";
+    let obj2 = "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n";
+    let removed = 10;
+    let o1 = header.len();
+    let o3 = o1 + obj1.len();
+    let o2 = o3 + obj3.len() + removed;
+    let body = format!("{header}{obj1}{obj3}{obj2}");
+    let doc = format!(
+        "{body}xref
+0 4
+0000000000 65535 f 
+{o1:010} 00000 n 
+{o2:010} 00000 n 
+{o3:010} 00000 n 
+trailer
+<</Root 1 0 R/Size 4>>
+startxref
+{}
+%%EOF",
+        body.len() + removed
+    );
+
+    let loaded = Document::load_mem(doc.as_bytes()).unwrap();
+    assert_eq!(loaded.get_pages().len(), 1);
+    assert_eq!(loaded.xref_recovery, Some(XrefRecovery::Reconstructed));
 }
 
 #[cfg(all(test, not(feature = "async")))]
